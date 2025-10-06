@@ -298,7 +298,12 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         agent = self.create_nha_agent(control_id)
 
         # Execute the LlmAgent (ADK builds expose different method names)
-        raw = self._invoke_llm_agent(agent, prompt, context)
+        raw = self._invoke_llm_agent(agent, prompt, {
+            **context,
+            "control_id": control_id,
+            "application_id": application_id,
+            "au_owner": au_owner,
+        })
 
         # Try to safely parse JSON from agent output
         parsed = _safe_parse_json(raw)
@@ -322,17 +327,33 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         As a last resort, if only `agent.model.complete` exists, we embed the context into
         the prompt. Note: that last fallback may not execute MCP tools.
         """
-        # Preferred: execute(prompt, context)
-        if hasattr(agent, 'execute') and callable(getattr(agent, 'execute')):
-            return agent.execute(prompt, context)
+        # Preferred: run(messages=..., invocation_context=...) to ensure tool calls
+        messages = [
+            {"role": "system", "content": self._get_nha_instruction(context.get("control_id", "C-305377"))},
+            {"role": "user", "content": prompt},
+        ]
+        invocation_context = {
+            "variables": context,
+            "tool_choice": "auto",
+            "allow_tool_calls": True,
+            "tool_timeouts": {
+                "tachyon_mcp_texttosql": int(os.getenv("DATABASE_AGENT_TIMEOUT", "300")),
+                "tachyon_mcp_mongo": int(os.getenv("DOCUMENT_ANALYSIS_TIMEOUT", "300")),
+                "tachyon_mcp_jira": int(os.getenv("JIRA_AGENT_TIMEOUT", "300")),
+            },
+            "execution": {"max_tool_calls": 8, "fail_on_tool_error": False},
+        }
 
-        # Alternate: run(prompt=..., context=...)
         if hasattr(agent, 'run') and callable(getattr(agent, 'run')):
             try:
-                return agent.run(prompt=prompt, context=context)
+                return agent.run(messages=messages, invocation_context=invocation_context)
             except TypeError:
-                # Some variants use (message, context)
-                return agent.run(prompt, context)
+                # Some builds accept (prompt, context)
+                pass
+
+        # Next best: execute(prompt, context)
+        if hasattr(agent, 'execute') and callable(getattr(agent, 'execute')):
+            return agent.execute(prompt, context)
 
         # Alternate: complete(prompt, context=...)
         if hasattr(agent, 'complete') and callable(getattr(agent, 'complete')):
