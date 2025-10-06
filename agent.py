@@ -2,11 +2,11 @@ import os
 import json
 from typing import Dict, List, Any, Optional
 try:
-    from google.adk.agents.lim_agent import LimAgent  # Preferred path
-    LIM_AVAILABLE = True
+    from google.adk.agents.llm_agent import LlmAgent  # Preferred agent class
+    LLM_AVAILABLE = True
 except Exception:
-    LimAgent = None  # type: ignore
-    LIM_AVAILABLE = False
+    LlmAgent = None  # type: ignore
+    LLM_AVAILABLE = False
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 from tachyon_adk_client import TachyonAdkClient
 from dotenv import load_dotenv
@@ -44,12 +44,12 @@ class NHAComplianceAgent:
     def __init__(self):
         self.model_name = f"openai/{os.getenv('MODEL', 'gemini-2.0-flash')}"
 
-    def create_nha_agent(self, control_id: str = "C-305377") -> LimAgent:
+    def create_nha_agent(self, control_id: str = "C-305377") -> Any:
         """Create NHA compliance agent with MongoDB MCP for prompt retrieval"""
         if control_id not in NHA_CONTROLS:
             raise ValueError(f"Control {control_id} not supported for NHA compliance")
 
-        return LimAgent(
+        return LlmAgent(
             model=TachyonAdkClient(model_name=self.model_name, name=f"NHA_{control_id}_Agent"),
             name=f"NHA_{control_id}_Agent",
             instruction=self._get_nha_instruction(control_id),
@@ -288,10 +288,10 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         }
 
         # Always use the LimAgent+MCP toolsets for execution to satisfy compliance workflow
-        if not LIM_AVAILABLE:
+        if not LLM_AVAILABLE:
             return {
                 "success": False,
-                "error": "LimAgent is not available in this environment. Please install google.adk and enable MCP toolsets.",
+                "error": "LlmAgent is not available in this environment. Please install google.adk and enable MCP toolsets.",
             }
 
         # Create the agent with all MCP toolsets
