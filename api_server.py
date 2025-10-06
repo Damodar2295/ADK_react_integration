@@ -56,10 +56,9 @@ def initialize_agent():
         print("🔧 Using fallback orchestrator")
         return False
 
-def extract_control_number(message: str) -> str:
-    """Extract control number from message"""
-    # Only support one control: C-305377
-    return 'C-305377'
+def extract_control_number(message: str, fallback: str = 'C-305377') -> str:
+    """Extract control number from message or return fallback (single-control)."""
+    return fallback
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -79,18 +78,22 @@ def chat():
 
         print(f"📨 Received message: {message[:100]}...")
 
-        # Extract control number from message (only C-305377 supported)
-        control_number = extract_control_number(message)
+        # Extract control number from context or message (only C-305377 supported)
+        control_number = frontend_context.get('controlId') or extract_control_number(message)
         print(f"🎯 Control number: {control_number}")
 
-        # Execute real agent with context
+        # Execute real agent with context and evidence
         print("🔄 Executing real NHA agent with MCP tools...")
         try:
-            response = nha_agent.run_nha_validation(
+            structured = nha_agent.validate_submission(
+                control_id=control_number,
                 application_id=frontend_context.get('applicationId', 'Unknown'),
-                control_id=control_number
+                au_owner=frontend_context.get('auOwner'),
+                evidence_files=frontend_context.get('evidenceFiles', [])
             )
-            print(f"✅ Agent execution successful: {len(response)} characters")
+            if not structured.get('success'):
+                return jsonify({"success": False, **structured})
+            print("✅ Agent execution successful")
         except Exception as e:
             print(f"❌ Agent execution failed: {e}")
             return jsonify({
@@ -99,18 +102,11 @@ def chat():
                 'message': 'Failed to execute NHA compliance agent. Please check agent configuration and MCP servers.'
             })
 
-        print(f"✅ Agent response generated: {len(response)} characters")
-
         # Return structured response
         return jsonify({
             'success': True,
-            'message': response,
-            'agent_name': agent.name if agent else 'NHA_Compliance_Assistant',
-            'mcp_servers': {
-                'sql': True,  # MCP_SQL_AVAILABLE if available
-                'mongo': True,  # MCP_MONGO_AVAILABLE if available
-                'jira': True,  # MCP_JIRA_AVAILABLE if available
-            }
+            'agent_name': 'NHA_Compliance_Assistant',
+            'data': structured
         })
 
     except Exception as e:

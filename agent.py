@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from google.adk.agents.lim_agent import LimAgent
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 from tachyon_adk_client import TachyonAdkClient
@@ -38,7 +38,7 @@ class NHAComplianceAgent:
     def __init__(self):
         self.model_name = f"openai/{os.getenv('MODEL', 'gemini-2.0-flash')}"
 
-    def create_nha_agent(self, control_id: str = "AC-2.3") -> LimAgent:
+    def create_nha_agent(self, control_id: str = "C-305377") -> LimAgent:
         """Create NHA compliance agent with MongoDB MCP for prompt retrieval"""
         if control_id not in NHA_CONTROLS:
             raise ValueError(f"Control {control_id} not supported for NHA compliance")
@@ -134,7 +134,7 @@ For non-compliant findings:
             )
         ]
 
-    def run_nha_validation(self, application_id: str, control_id: str = "AC-2.3") -> str:
+    def run_nha_validation(self, application_id: str, control_id: str = "C-305377") -> str:
         """Run NHA compliance validation with MongoDB prompt integration"""
         if control_id not in NHA_CONTROLS:
             return f"❌ Error: Control '{control_id}' not supported. Available: {', '.join(NHA_CONTROLS.keys())}"
@@ -184,6 +184,123 @@ Start with Q1: Application NHA Identification.
 
         except Exception as e:
             return f"❌ Error running NHA validation: {str(e)}"
+
+    # --- New High-level API for Frontend/Bridge ---
+    def validate_submission(
+        self,
+        control_id: str,
+        application_id: str,
+        au_owner: Optional[str] = None,
+        evidence_files: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Validate a submission coming from the frontend.
+
+        Parameters
+        - control_id: Only 'C-305377' supported
+        - application_id: App identifier provided by user
+        - au_owner: Application Unit/Owner name
+        - evidence_files: List of evidence metadata dicts
+
+        Returns
+        - Structured dict with per-question results and overall compliance
+        """
+        if control_id not in NHA_CONTROLS:
+            return {
+                "success": False,
+                "error": f"Unsupported control_id: {control_id}",
+                "supported_controls": list(NHA_CONTROLS.keys()),
+            }
+
+        control_info = NHA_CONTROLS[control_id]
+
+        # Create the agent with all MCP toolsets
+        agent = self.create_nha_agent(control_id)
+
+        # Strict JSON schema for agent output – ensures backend can parse reliably
+        output_schema = {
+            "type": "object",
+            "required": [
+                "controlId",
+                "applicationId",
+                "auOwner",
+                "results",
+                "overallCompliance",
+            ],
+            "properties": {
+                "controlId": {"type": "string"},
+                "applicationId": {"type": "string"},
+                "auOwner": {"type": "string"},
+                "results": {
+                    "type": "object",
+                    "required": ["Q1", "Q2", "Q3", "Q4"],
+                    "properties": {
+                        "Q1": {"type": "object"},
+                        "Q2": {"type": "object"},
+                        "Q3": {"type": "object"},
+                        "Q4": {"type": "object"},
+                    },
+                },
+                "overallCompliance": {"type": "string"},
+                "esarValidation": {"type": "object"},
+                "evidenceAnalysis": {"type": "object"},
+                "jira": {"type": "object"},
+            },
+        }
+
+        # Prompt that drives the LimAgent to call MCP tools and return JSON
+        prompt = f"""
+You are the NHA Compliance Validation Agent for control {control_id}: {control_info['name']}.
+You must use the available MCP tools to perform real validation:
+- SQL (tachyon_mcp_texttosql) to query eSAR/ServiceAccounts for registration verification
+- MongoDB (tachyon_mcp_mongo) to validate evidence relevance and overall compliance
+- Jira (tachyon_mcp_jira) to create a ticket if non-compliant
+
+Inputs from frontend:
+- Application ID: {application_id}
+- AU Owner: {au_owner or 'Unknown'}
+- Evidence Files Metadata: Provided in the context as 'evidenceFiles'.
+
+Follow the 4-question workflow strictly (Q1..Q4). Where a tool is required, call it.
+
+Return ONLY a single JSON object conforming to this schema:
+{json.dumps(output_schema)}
+
+Where each of results.Qx is an object like:
+{{
+  "answer": "YES"|"NO",
+  "rationale": "string",
+  "evidenceUsed": [{{"filename": "string"}}],
+  "score": 0-25
+}}
+
+overallCompliance must be one of ["COMPLIANT", "PARTIALLY_COMPLIANT", "NON_COMPLIANT"].
+If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
+"""
+
+        context: Dict[str, Any] = {
+            "control_id": control_id,
+            "application_id": application_id,
+            "au_owner": au_owner,
+            "evidenceFiles": evidence_files or [],
+        }
+
+        # Execute the LimAgent
+        raw = agent.execute(prompt, context)
+
+        # Try to safely parse JSON from agent output
+        parsed = _safe_parse_json(raw)
+        if not isinstance(parsed, dict):
+            return {
+                "success": False,
+                "error": "Agent did not return valid JSON",
+                "raw": raw,
+            }
+
+        parsed.setdefault("controlId", control_id)
+        parsed.setdefault("applicationId", application_id)
+        parsed.setdefault("auOwner", au_owner)
+        parsed["success"] = True
+        return parsed
 
 
 def main():
