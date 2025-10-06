@@ -297,8 +297,8 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         # Create the agent with all MCP toolsets
         agent = self.create_nha_agent(control_id)
 
-        # Execute the LimAgent
-        raw = agent.execute(prompt, context)
+        # Execute the LlmAgent (ADK builds expose different method names)
+        raw = self._invoke_llm_agent(agent, prompt, context)
 
         # Try to safely parse JSON from agent output
         parsed = _safe_parse_json(raw)
@@ -314,6 +314,45 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         parsed.setdefault("auOwner", au_owner)
         parsed["success"] = True
         return parsed
+
+    def _invoke_llm_agent(self, agent: Any, prompt: str, context: Dict[str, Any]) -> str:
+        """Call the underlying ADK LlmAgent using whatever public method is available.
+
+        Some ADK builds expose `execute(prompt, context)`, others `run(...)` or `complete(...)`.
+        As a last resort, if only `agent.model.complete` exists, we embed the context into
+        the prompt. Note: that last fallback may not execute MCP tools.
+        """
+        # Preferred: execute(prompt, context)
+        if hasattr(agent, 'execute') and callable(getattr(agent, 'execute')):
+            return agent.execute(prompt, context)
+
+        # Alternate: run(prompt=..., context=...)
+        if hasattr(agent, 'run') and callable(getattr(agent, 'run')):
+            try:
+                return agent.run(prompt=prompt, context=context)
+            except TypeError:
+                # Some variants use (message, context)
+                return agent.run(prompt, context)
+
+        # Alternate: complete(prompt, context=...)
+        if hasattr(agent, 'complete') and callable(getattr(agent, 'complete')):
+            try:
+                return agent.complete(prompt, context=context)
+            except TypeError:
+                return agent.complete(prompt)
+
+        # Last-resort fallback: model.complete (may not trigger MCP tool calls)
+        if hasattr(agent, 'model') and hasattr(agent.model, 'complete'):
+            merged = f"""
+{prompt}
+
+---
+Context (JSON):
+{json.dumps(context)}
+"""
+            return agent.model.complete(merged)
+
+        raise RuntimeError("This ADK LlmAgent build exposes no supported invocation method (execute/run/complete). Please update ADK or use LimAgent.")
 
     # (All non-MCP fallbacks removed to ensure MCP-only execution as required)
 
