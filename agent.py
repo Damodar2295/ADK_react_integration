@@ -1,10 +1,16 @@
 import os
 import json
 from typing import Dict, List, Any, Optional
-from google.adk.agents.lim_agent import LimAgent
+try:
+    from google.adk.agents.lim_agent import LimAgent  # Preferred path
+    LIM_AVAILABLE = True
+except Exception:
+    LimAgent = None  # type: ignore
+    LIM_AVAILABLE = False
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 from tachyon_adk_client import TachyonAdkClient
 from dotenv import load_dotenv
+import json
 
 # Load environment variables
 load_dotenv(override=True)
@@ -213,9 +219,6 @@ Start with Q1: Application NHA Identification.
 
         control_info = NHA_CONTROLS[control_id]
 
-        # Create the agent with all MCP toolsets
-        agent = self.create_nha_agent(control_id)
-
         # Strict JSON schema for agent output – ensures backend can parse reliably
         output_schema = {
             "type": "object",
@@ -284,6 +287,16 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
             "evidenceFiles": evidence_files or [],
         }
 
+        # Always use the LimAgent+MCP toolsets for execution to satisfy compliance workflow
+        if not LIM_AVAILABLE:
+            return {
+                "success": False,
+                "error": "LimAgent is not available in this environment. Please install google.adk and enable MCP toolsets.",
+            }
+
+        # Create the agent with all MCP toolsets
+        agent = self.create_nha_agent(control_id)
+
         # Execute the LimAgent
         raw = agent.execute(prompt, context)
 
@@ -301,6 +314,8 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         parsed.setdefault("auOwner", au_owner)
         parsed["success"] = True
         return parsed
+
+    # (All non-MCP fallbacks removed to ensure MCP-only execution as required)
 
 
 def main():
