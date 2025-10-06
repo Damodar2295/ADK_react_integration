@@ -18,11 +18,11 @@ missing_vars = [var for var in required_vars if not os.getenv(var)]
 if missing_vars:
     print(f"[WARNING] Missing environment variables: {missing_vars}")
 
-# NHA Compliance Controls - Focused Solution
+# NHA Compliance Controls - Single Control Solution
 NHA_CONTROLS = {
-    "AC-2.3": {
-        "name": "Account Management - Non-Human Accounts",
-        "description": "Applications with non-platform-based service accounts must be properly managed and authenticated.",
+    "C-305377": {
+        "name": "Non-Human Account Inventory and Password Validation",
+        "description": "Comprehensive validation of non-human account inventory and password compliance across all applications.",
         "workflow_phases": {
             "Q1": "Application NHA Identification",
             "Q2": "ESAR Registration Validation",
