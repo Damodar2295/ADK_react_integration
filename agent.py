@@ -17,6 +17,19 @@ import time
 # Load environment variables
 load_dotenv(override=True)
 
+# Ensure ServiceAccounts table is accessible and schema is live
+_current_exact_entities = os.getenv('EXACT_ENTITY_NAMES', '')
+if 'ServiceAccounts' not in _current_exact_entities:
+    if _current_exact_entities:
+        os.environ['EXACT_ENTITY_NAMES'] = f"{_current_exact_entities},ServiceAccounts"
+    else:
+        os.environ['EXACT_ENTITY_NAMES'] = 'ServiceAccounts'
+    print("[INFO] Added ServiceAccounts to EXACT_ENTITY_NAMES for schema access")
+
+if os.getenv('SCHEMA_SOURCE') != 'db':
+    os.environ['SCHEMA_SOURCE'] = 'db'
+    print("[INFO] Set SCHEMA_SOURCE to 'db' for live database schema access")
+
 # Get environment variables for MCP tools
 env_variables = os.environ.copy()
 
@@ -45,6 +58,10 @@ class NHAComplianceAgent:
 
     def __init__(self):
         self.model_name = f"openai/{os.getenv('MODEL', 'gemini-2.0-flash')}"
+        # Print minimal config to help diagnose envs at runtime
+        print(f"[CONFIG] Model: {self.model_name}")
+        print(f"[CONFIG] EXACT_ENTITY_NAMES: {os.getenv('EXACT_ENTITY_NAMES')}")
+        print(f"[CONFIG] SCHEMA_SOURCE: {os.getenv('SCHEMA_SOURCE')}")
 
     def create_nha_agent(self, control_id: str = "C-305377") -> Any:
         """Create NHA compliance agent with MongoDB MCP for prompt retrieval"""
@@ -302,11 +319,7 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
         # Create the agent with all MCP toolsets
         agent = self.create_nha_agent(control_id)
 
-        # Execute the LlmAgent with run(messages, invocation_context)
-        messages = [
-            {"role": "system", "content": self._get_nha_instruction(control_id)},
-            {"role": "user", "content": prompt},
-        ]
+        # Build correct context object; ensure dict is used and not a string
         invocation_context = {
             "variables": {
                 **context,
@@ -324,10 +337,18 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
             "execution": {"max_tool_calls": 8, "fail_on_tool_error": False},
         }
 
+        # Use a single-turn message list as LlmAgent expects
+        messages = [
+            {"role": "system", "content": self._get_nha_instruction(control_id)},
+            {"role": "user", "content": prompt},
+        ]
+
+        # Prefer run(messages, invocation_context) for proper tool routing
         if hasattr(agent, 'run') and callable(getattr(agent, 'run')):
             raw = agent.run(messages=messages, invocation_context=invocation_context)
+        elif hasattr(agent, 'execute') and callable(getattr(agent, 'execute')):
+            raw = agent.execute(prompt, invocation_context["variables"])
         else:
-            # Compatibility fallback
             raw = self._invoke_llm_agent(agent, prompt, invocation_context["variables"])
 
         # Try to safely parse JSON from agent output
@@ -676,3 +697,4 @@ def show_extension_guide():
 
 if __name__ == "__main__":
     main()
+    
