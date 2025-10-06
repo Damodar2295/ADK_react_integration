@@ -11,6 +11,9 @@ from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParamet
 from tachyon_adk_client import TachyonAdkClient
 from dotenv import load_dotenv
 import json
+import requests
+import logging
+import time
 
 # Load environment variables
 load_dotenv(override=True)
@@ -287,23 +290,50 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
             "evidenceFiles": evidence_files or [],
         }
 
-        # Always use the LimAgent+MCP toolsets for execution to satisfy compliance workflow
+        # Ensure ADK LlmAgent is available for MCP tool orchestration
         if not LLM_AVAILABLE:
             return {
                 "success": False,
                 "error": "LlmAgent is not available in this environment. Please install google.adk and enable MCP toolsets.",
             }
 
+        # If DIRECT_MCP_MODE is enabled, bypass agent and call MCP servers over HTTP directly
+        if os.getenv("DIRECT_MCP_MODE", "false").lower() == "true":
+            return self._validate_submission_direct_mcp(control_id, application_id, au_owner, evidence_files)
+
+        if os.getenv("DIRECT_MCP_STDIO", "false").lower() == "true":
+            return self._validate_submission_direct_stdio(control_id, application_id, au_owner, evidence_files)
+
         # Create the agent with all MCP toolsets
         agent = self.create_nha_agent(control_id)
 
-        # Execute the LlmAgent (ADK builds expose different method names)
-        raw = self._invoke_llm_agent(agent, prompt, {
-            **context,
-            "control_id": control_id,
-            "application_id": application_id,
-            "au_owner": au_owner,
-        })
+        # Execute the LlmAgent with run(messages, invocation_context)
+        messages = [
+            {"role": "system", "content": self._get_nha_instruction(control_id)},
+            {"role": "user", "content": prompt},
+        ]
+        invocation_context = {
+            "variables": {
+                **context,
+                "control_id": control_id,
+                "application_id": application_id,
+                "au_owner": au_owner,
+            },
+            "tool_choice": "auto",
+            "allow_tool_calls": True,
+            "tool_timeouts": {
+                "tachyon_mcp_texttosql": int(os.getenv("DATABASE_AGENT_TIMEOUT", "300")),
+                "tachyon_mcp_mongo": int(os.getenv("DOCUMENT_ANALYSIS_TIMEOUT", "300")),
+                "tachyon_mcp_jira": int(os.getenv("JIRA_AGENT_TIMEOUT", "300")),
+            },
+            "execution": {"max_tool_calls": 8, "fail_on_tool_error": False},
+        }
+
+        if hasattr(agent, 'run') and callable(getattr(agent, 'run')):
+            raw = agent.run(messages=messages, invocation_context=invocation_context)
+        else:
+            # Compatibility fallback
+            raw = self._invoke_llm_agent(agent, prompt, invocation_context["variables"])
 
         # Try to safely parse JSON from agent output
         parsed = _safe_parse_json(raw)
@@ -374,6 +404,245 @@ Context (JSON):
             return agent.model.complete(merged)
 
         raise RuntimeError("This ADK LlmAgent build exposes no supported invocation method (execute/run/complete). Please update ADK or use LimAgent.")
+
+    # ----------------- Direct MCP over HTTP (no agent) -----------------
+    def _validate_submission_direct_mcp(
+        self,
+        control_id: str,
+        application_id: str,
+        au_owner: Optional[str],
+        evidence_files: Optional[List[Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        """Call MCP servers via their HTTP frontends (FastAPI wrappers) directly.
+
+        Expected env:
+        - DATABASE_MCP_URL (e.g., http://localhost:7301)
+        - MONGO_MCP_URL   (e.g., http://localhost:7302)
+        - JIRA_MCP_URL    (e.g., http://localhost:7303)
+        """
+        sql_url = os.getenv('DATABASE_MCP_URL')
+        mongo_url = os.getenv('MONGO_MCP_URL')
+        jira_url = os.getenv('JIRA_MCP_URL')
+
+        def _post(url: Optional[str], path: str, body: Dict[str, Any]) -> Any:
+            if not url:
+                return {"error": "service_url_missing"}
+            try:
+                r = requests.post(url.rstrip('/') + path, json=body, timeout=30)
+                if r.status_code >= 200 and r.status_code < 300:
+                    return r.json()
+                return {"error": f"http_{r.status_code}", "body": r.text[:500]}
+            except Exception as e:
+                return {"error": "exception", "message": str(e)}
+
+        # Q1: NHA identification (count service accounts for app)
+        q1_sql = "SELECT COUNT(1) as cnt FROM ServiceAccounts WHERE [Application ID]=@p1"
+        q1_res = _post(sql_url, '/query', {"sql": q1_sql, "params": [application_id]})
+        try:
+            cnt = int((q1_res.get('rows') or [[0]])[0][0]) if isinstance(q1_res, dict) else 0
+        except Exception:
+            cnt = 0
+        q1 = {
+            "answer": "YES" if cnt > 0 else "NO",
+            "rationale": f"Found {cnt} service accounts for application",
+            "evidenceUsed": [],
+            "score": 25 if cnt > 0 else 15
+        }
+
+        # Q2: eSAR registration
+        q2_sql = (
+            "SELECT COUNT(1) as cnt FROM ServiceAccounts "
+            "WHERE [Application ID]=@p1 AND [Account Certification] IS NOT NULL"
+        )
+        q2_res = _post(sql_url, '/query', {"sql": q2_sql, "params": [application_id]})
+        try:
+            cnt2 = int((q2_res.get('rows') or [[0]])[0][0]) if isinstance(q2_res, dict) else 0
+        except Exception:
+            cnt2 = 0
+        q2 = {
+            "answer": "YES" if cnt2 > 0 else "NO",
+            "rationale": f"{cnt2} accounts certified in eSAR",
+            "evidenceUsed": [],
+            "score": 25 if cnt2 > 0 else 15
+        }
+
+        # Q3/Q4: Evidence analysis via Mongo MCP
+        ev_body = {
+            "applicationId": application_id,
+            "auOwner": au_owner,
+            "evidenceFiles": evidence_files or []
+        }
+        ev_res = _post(mongo_url, '/analyze_evidence', ev_body)
+        q3 = ev_res.get('passwordConstruction', {"answer": "UNKNOWN", "rationale": "no data", "score": 15}) if isinstance(ev_res, dict) else {"answer": "UNKNOWN", "rationale": "no data", "score": 15}
+        q4 = ev_res.get('passwordRotation', {"answer": "UNKNOWN", "rationale": "no data", "score": 15}) if isinstance(ev_res, dict) else {"answer": "UNKNOWN", "rationale": "no data", "score": 15}
+
+        # Overall scoring
+        total = sum([x.get('score', 0) for x in [q1, q2, q3, q4]])
+        overall = "COMPLIANT" if total >= 75 else ("PARTIALLY_COMPLIANT" if total >= 50 else "NON_COMPLIANT")
+
+        # Jira ticket creation for non-compliance
+        jira_info: Dict[str, Any] = {}
+        if overall == "NON_COMPLIANT":
+            j_body = {
+                "projectKey": os.getenv('JIRA_PROJECT_KEY', 'BDFS'),
+                "summary": f"NHA Non-Compliance - {control_id} - {application_id}",
+                "priority": os.getenv('JIRA_PRIORITY', 'High'),
+                "description": json.dumps({"Q1": q1, "Q2": q2, "Q3": q3, "Q4": q4})
+            }
+            j_res = _post(jira_url, '/tickets', j_body)
+            if isinstance(j_res, dict):
+                jira_info = {"ticketKey": j_res.get('key') or j_res.get('ticketKey'), "url": j_res.get('url')}
+
+        return {
+            "success": True,
+            "controlId": control_id,
+            "applicationId": application_id,
+            "auOwner": au_owner,
+            "results": {"Q1": q1, "Q2": q2, "Q3": q3, "Q4": q4},
+            "overallCompliance": overall,
+            "esarValidation": {"sql": {"q1": q1, "q2": q2}},
+            "evidenceAnalysis": ev_res if isinstance(ev_res, dict) else {"raw": ev_res},
+            "jira": jira_info,
+        }
+
+    # ----------------- Direct MCP via stdio (no agent, no HTTP) -----------------
+    def _validate_submission_direct_stdio(
+        self,
+        control_id: str,
+        application_id: str,
+        au_owner: Optional[str],
+        evidence_files: Optional[List[Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        """Invoke local MCP servers directly over stdio using MCPToolset.
+
+        This does not require any HTTP wrapper and does not use the agent.
+        """
+        log = logging.getLogger('mcp_stdio')
+        log.info("[STDIO] begin validation | control=%s app=%s au=%s evidences=%s",
+                 control_id, application_id, au_owner, len(evidence_files or []))
+        # Create clients
+        sql_client = MCPToolset(
+            connection_params=StdioServerParameters(
+                command='python', args=['-m', 'tachyon_mcp_texttosql'], env=env_variables,
+                read_timeout_seconds=int(os.getenv('DATABASE_AGENT_TIMEOUT', '300'))
+            )
+        )
+        mongo_client = MCPToolset(
+            connection_params=StdioServerParameters(
+                command='python', args=['-m', 'tachyon_mcp_mongo'], env=env_variables,
+                read_timeout_seconds=int(os.getenv('DOCUMENT_ANALYSIS_TIMEOUT', '300'))
+            )
+        )
+        jira_client = MCPToolset(
+            connection_params=StdioServerParameters(
+                command='python', args=['-m', 'tachyon_mcp_jira'], env=env_variables,
+                read_timeout_seconds=int(os.getenv('JIRA_AGENT_TIMEOUT', '300'))
+            )
+        )
+
+        def _s(obj: Any) -> str:
+            try:
+                return json.dumps(obj, ensure_ascii=False)[:1200]
+            except Exception:
+                return str(obj)[:1200]
+
+        def _mcp_call(client: Any, op: str, payload: Dict[str, Any]) -> Any:
+            start = time.time()
+            log.debug("[STDIO] -> call op=%s payload=%s", op, _s(payload))
+            # Try a series of common method names to invoke a tool
+            for name in ('invoke', 'call', 'run', 'request', 'execute', '__call__'):
+                fn = getattr(client, name, None)
+                if callable(fn):
+                    try:
+                        res = fn(op, payload)
+                        log.debug("[STDIO] <- ok op=%s in %.3fs result=%s", op, time.time()-start, _s(res))
+                        return res
+                    except TypeError:
+                        # Some variants expect just payload
+                        try:
+                            res = fn(payload)
+                            log.debug("[STDIO] <- ok(op-only) op=%s in %.3fs result=%s", op, time.time()-start, _s(res))
+                            return res
+                        except Exception:
+                            continue
+                    except Exception as e:
+                        log.exception("[STDIO] call error op=%s via %s: %s", op, name, e)
+                        continue
+            log.error("[STDIO] no_invoke_method for op=%s", op)
+            return {"error": "no_invoke_method"}
+
+        # Q1: NHA identification
+        q1_sql = "SELECT COUNT(1) as cnt FROM ServiceAccounts WHERE [Application ID]=@p1"
+        log.info("[STDIO] Q1: NHA identification (SQL)")
+        q1_res = _mcp_call(sql_client, 'query', {"sql": q1_sql, "params": [application_id]})
+        try:
+            cnt = int((q1_res.get('rows') or [[0]])[0][0]) if isinstance(q1_res, dict) else 0
+        except Exception:
+            cnt = 0
+        q1 = {
+            "answer": "YES" if cnt > 0 else "NO",
+            "rationale": f"Found {cnt} service accounts for application",
+            "evidenceUsed": [],
+            "score": 25 if cnt > 0 else 15
+        }
+
+        # Q2: eSAR registration
+        q2_sql = (
+            "SELECT COUNT(1) as cnt FROM ServiceAccounts "
+            "WHERE [Application ID]=@p1 AND [Account Certification] IS NOT NULL"
+        )
+        log.info("[STDIO] Q2: eSAR registration (SQL)")
+        q2_res = _mcp_call(sql_client, 'query', {"sql": q2_sql, "params": [application_id]})
+        try:
+            cnt2 = int((q2_res.get('rows') or [[0]])[0][0]) if isinstance(q2_res, dict) else 0
+        except Exception:
+            cnt2 = 0
+        q2 = {
+            "answer": "YES" if cnt2 > 0 else "NO",
+            "rationale": f"{cnt2} accounts certified in eSAR",
+            "evidenceUsed": [],
+            "score": 25 if cnt2 > 0 else 15
+        }
+
+        # Evidence/Q3/Q4 via mongo MCP
+        log.info("[STDIO] Q3/Q4: evidence analysis (Mongo)")
+        ev_res = _mcp_call(mongo_client, 'analyze_evidence', {
+            "applicationId": application_id,
+            "auOwner": au_owner,
+            "evidenceFiles": evidence_files or []
+        })
+        q3 = ev_res.get('passwordConstruction', {"answer": "UNKNOWN", "rationale": "no data", "score": 15}) if isinstance(ev_res, dict) else {"answer": "UNKNOWN", "rationale": "no data", "score": 15}
+        q4 = ev_res.get('passwordRotation', {"answer": "UNKNOWN", "rationale": "no data", "score": 15}) if isinstance(ev_res, dict) else {"answer": "UNKNOWN", "rationale": "no data", "score": 15}
+
+        # Overall
+        total = sum([x.get('score', 0) for x in [q1, q2, q3, q4]])
+        overall = "COMPLIANT" if total >= 75 else ("PARTIALLY_COMPLIANT" if total >= 50 else "NON_COMPLIANT")
+
+        jira_info: Dict[str, Any] = {}
+        if overall == "NON_COMPLIANT":
+            log.info("[STDIO] Non-compliant → creating Jira ticket")
+            j_res = _mcp_call(jira_client, 'create_ticket', {
+                "projectKey": os.getenv('JIRA_PROJECT_KEY', 'BDFS'),
+                "summary": f"NHA Non-Compliance - {control_id} - {application_id}",
+                "priority": os.getenv('JIRA_PRIORITY', 'High'),
+                "description": json.dumps({"Q1": q1, "Q2": q2, "Q3": q3, "Q4": q4})
+            })
+            if isinstance(j_res, dict):
+                jira_info = {"ticketKey": j_res.get('key') or j_res.get('ticketKey'), "url": j_res.get('url')}
+
+        payload = {
+            "success": True,
+            "controlId": control_id,
+            "applicationId": application_id,
+            "auOwner": au_owner,
+            "results": {"Q1": q1, "Q2": q2, "Q3": q3, "Q4": q4},
+            "overallCompliance": overall,
+            "esarValidation": {"sql": {"q1": q1, "q2": q2}},
+            "evidenceAnalysis": ev_res if isinstance(ev_res, dict) else {"raw": ev_res},
+            "jira": jira_info,
+        }
+        log.info("[STDIO] done validation | overall=%s | ticket=%s", overall, payload.get("jira", {}).get("ticketKey"))
+        return payload
 
     # (All non-MCP fallbacks removed to ensure MCP-only execution as required)
 
