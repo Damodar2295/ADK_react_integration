@@ -434,7 +434,7 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
                 raise RuntimeError("No LLM agent available. Install google.adk or set USE_MCP=true for MCP paths.")
 
         # Try to safely parse JSON from agent output
-        parsed = _safe_parse_json(raw)
+        parsed = parse_llm_json(raw)
         if not isinstance(parsed, dict):
             return {
                 "success": False,
