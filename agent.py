@@ -13,6 +13,90 @@ from dotenv import load_dotenv
 import json
 import logging
 import time
+import base64
+import mimetypes
+from typing import Tuple
+
+# --- Mongo helpers (lazy singleton) ---
+try:
+    from pymongo import MongoClient  # type: ignore
+except Exception:
+    MongoClient = None  # type: ignore
+
+_mongo_client = None
+
+def _get_mongo():
+    global _mongo_client
+    if _mongo_client is None:
+        if MongoClient is None:
+            raise RuntimeError("pymongo is not installed. Please install it or set USE_MCP=true.")
+        uri = os.getenv("MONGO_URI")
+        if not uri:
+            raise RuntimeError("MONGO_URI not set. Please provide Mongo connection string.")
+        _mongo_client = MongoClient(uri)
+    return _mongo_client
+
+def fetch_system_instruction(app_id: str, control_id: str) -> Optional[str]:
+    db_name = os.getenv("MONGO_DB", "iam_eval")
+    coll_name = os.getenv("MONGO_SYSTEM_COLLECTION", "system_instructions")
+    client = _get_mongo()
+    doc = client[db_name][coll_name].find_one(
+        {"appId": app_id, "controlId": control_id},
+        {"systemInstruction": 1, "_id": 0}
+    )
+    return (doc or {}).get("systemInstruction")
+
+# --- Evidence normalization helpers ---
+def _guess_mime(file_name: str) -> str:
+    mt, _ = mimetypes.guess_type(file_name or "")
+    return mt or "application/octet-stream"
+
+def _strip_data_uri(b64: str) -> str:
+    if isinstance(b64, str) and "base64," in b64[:80]:
+        return b64.split("base64,", 1)[-1]
+    return b64
+
+def _to_base64_from_bytes(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+def _read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+def normalize_evidences(raw_list: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for idx, ev in enumerate(raw_list or []):
+        file_name = ev.get("fileName") or ev.get("name") or f"evidence_{idx}"
+        mime_type = ev.get("mimeType") or _guess_mime(file_name)
+
+        b64 = ev.get("base64")
+        if isinstance(b64, str) and b64:
+            out.append({"fileName": file_name, "mimeType": mime_type, "base64": _strip_data_uri(b64)})
+            continue
+
+        b = ev.get("bytes") or ev.get("buffer")
+        if isinstance(b, (bytes, bytearray)):
+            out.append({"fileName": file_name, "mimeType": mime_type, "base64": _to_base64_from_bytes(bytes(b))})
+            continue
+
+        file_path = ev.get("filePath") or ev.get("path")
+        if isinstance(file_path, str) and os.path.exists(file_path):
+            data = _read_file_bytes(file_path)
+            out.append({"fileName": file_name, "mimeType": mime_type, "base64": _to_base64_from_bytes(data)})
+            continue
+        # else skip invalid entries silently
+    return out
+
+def parse_llm_json(txt: str) -> Dict[str, Any]:
+    s = (txt or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        return {"Answer": s, "Quality": "N/A", "Source": "", "Summary": s[:200], "Reference": ""}
 
 # Load environment variables
 load_dotenv(override=True)
@@ -237,6 +321,8 @@ Start with Q1: Application NHA Identification.
             }
 
         control_info = NHA_CONTROLS[control_id]
+        # Normalize AU owner: keep dummy value if not provided to avoid breaking callers
+        au_owner_norm = au_owner or os.getenv('DEFAULT_AU_OWNER', 'N/A')
 
         # Strict JSON schema for agent output – ensures backend can parse reliably
         output_schema = {
@@ -306,50 +392,46 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
             "evidenceFiles": evidence_files or [],
         }
 
-        # Ensure ADK LlmAgent is available for MCP tool orchestration
-        if not LLM_AVAILABLE:
-            return {
-                "success": False,
-                "error": "LlmAgent is not available in this environment. Please install google.adk and enable MCP toolsets.",
+        # Feature flag: Use MCP tool flows when explicitly enabled
+        use_mcp = os.getenv("USE_MCP", "false").lower() == "true"
+
+        # Local stdio MCP path
+        if use_mcp and os.getenv("DIRECT_MCP_STDIO", "false").lower() == "true":
+            return self._validate_submission_direct_stdio(control_id, application_id, au_owner_norm, evidence_files)
+
+        # Mongo + LLM only (default path – no MCP calls)
+        if not use_mcp:
+            # 1) Fetch system instruction
+            sys_instr = fetch_system_instruction(application_id, control_id)
+            if not sys_instr:
+                return {
+                    "success": False,
+                    "error": f"No systemInstruction found for appId={application_id}, controlId={control_id}",
+                }
+
+            # 2) Normalize evidences
+            norm_evs = normalize_evidences(evidence_files or [])
+
+            # 3) Build messages for LLM (no tool calls)
+            agent = self.create_nha_agent(control_id) if LLM_AVAILABLE else None
+            user_payload = {
+                "appId": application_id,
+                "controlId": control_id,
+                "auOwner": au_owner_norm,
+                "evidences": [{"fileName": e.get("fileName"), "mimeType": e.get("mimeType") } for e in norm_evs],
             }
+            messages = [
+                {"role": "system", "content": sys_instr},
+                {"role": "user", "content": json.dumps(user_payload)},
+            ]
 
-        if os.getenv("DIRECT_MCP_STDIO", "false").lower() == "true":
-            return self._validate_submission_direct_stdio(control_id, application_id, au_owner, evidence_files)
-
-        # Create the agent with all MCP toolsets
-        agent = self.create_nha_agent(control_id)
-
-        # Build correct context object; ensure dict is used and not a string
-        invocation_context = {
-            "variables": {
-                **context,
-                "control_id": control_id,
-                "application_id": application_id,
-                "au_owner": au_owner,
-            },
-            "tool_choice": "auto",
-            "allow_tool_calls": True,
-            "tool_timeouts": {
-                "tachyon_mcp_texttosql": int(os.getenv("DATABASE_AGENT_TIMEOUT", "300")),
-                "tachyon_mcp_mongo": int(os.getenv("DOCUMENT_ANALYSIS_TIMEOUT", "300")),
-                "tachyon_mcp_jira": int(os.getenv("JIRA_AGENT_TIMEOUT", "300")),
-            },
-            "execution": {"max_tool_calls": 8, "fail_on_tool_error": False},
-        }
-
-        # Use a single-turn message list as LlmAgent expects
-        messages = [
-            {"role": "system", "content": self._get_nha_instruction(control_id)},
-            {"role": "user", "content": prompt},
-        ]
-
-        # Prefer run(messages, invocation_context) for proper tool routing
-        if hasattr(agent, 'run') and callable(getattr(agent, 'run')):
-            raw = agent.run(messages=messages, invocation_context=invocation_context)
-        elif hasattr(agent, 'execute') and callable(getattr(agent, 'execute')):
-            raw = agent.execute(prompt, invocation_context["variables"])
-        else:
-            raw = self._invoke_llm_agent(agent, prompt, invocation_context["variables"])
+            if agent and hasattr(agent, 'run'):
+                raw = agent.run(messages=messages, invocation_context={"variables": {"appId": application_id, "controlId": control_id}})
+            elif agent and hasattr(agent, 'execute'):
+                raw = agent.execute(json.dumps(user_payload), {})
+            else:
+                # As ultimate fallback, call underlying model if exposed
+                raise RuntimeError("No LLM agent available. Install google.adk or set USE_MCP=true for MCP paths.")
 
         # Try to safely parse JSON from agent output
         parsed = _safe_parse_json(raw)
@@ -362,7 +444,7 @@ If NON_COMPLIANT, create a Jira ticket and include jira.ticketKey and jira.url.
 
         parsed.setdefault("controlId", control_id)
         parsed.setdefault("applicationId", application_id)
-        parsed.setdefault("auOwner", au_owner)
+        parsed.setdefault("auOwner", au_owner_norm)
         parsed["success"] = True
         return parsed
 
