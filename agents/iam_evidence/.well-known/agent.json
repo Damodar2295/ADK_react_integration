@@ -1,0 +1,8 @@
+{
+  "name": "iam_evidence_agent",
+  "description": "Evaluates IAM compliance evidence and generates structured assessment reports.",
+  "endpoints": [
+    "run"
+  ],
+  "version": "1.0.0"
+}
