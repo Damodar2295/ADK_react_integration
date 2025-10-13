@@ -3,7 +3,7 @@ import base64
 import json
 import os
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
 
@@ -114,6 +114,31 @@ def parse_model_json(txt: str) -> dict:
             "Reference": ""
         }
 
+# Tools exposed to the LLM
+
+def get_system_instruction(appId: str, controlId: str) -> str:  # noqa: N802 (match input casing)
+    """Return the resolved system instruction text for this app/control."""
+    txt = resolve_system_instruction(appId, controlId)
+    if not txt:
+        raise ValueError("System instruction not found for the given appId/controlId")
+    return txt
+
+def validate_and_list_evidences(evidences: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Validate evidence objects and return cleaned list and names."""
+    cleaned = validate_evidences(evidences)
+    names = [e["fileName"] for e in cleaned]
+    return {"cleaned": cleaned, "evidenceNames": names}
+
+def iam_evidence_result(Answer: str, Quality: str, Source: str, Summary: str, Reference: str) -> Dict[str, str]:
+    """Final structured result to be emitted as a functionResponse."""
+    return {
+        "Answer": Answer,
+        "Quality": Quality,
+        "Source": Source,
+        "Summary": Summary,
+        "Reference": Reference,
+    }
+
 # Create the IAM Evidence Agent
 def create_iam_evidence_agent():
     """Create the IAM Evidence evaluation agent using LlmAgent + TachyonAdkClient."""
@@ -132,11 +157,23 @@ def create_iam_evidence_agent():
         uuid=os.getenv('UUID'),
     )
 
+    instruction_text = (
+        "You are an IAM compliance expert. Follow these steps strictly:"  # concise, deterministic
+        "\n1) The user provides a JSON payload as inline data with fields appId, controlId, evidences[]."
+        "\n2) Read that JSON and extract appId, controlId, and evidences."
+        "\n3) Call get_system_instruction(appId, controlId) to retrieve the system instruction text."
+        "\n4) Call validate_and_list_evidences(evidences) to validate and list evidence names."
+        "\n5) Using the retrieved system instruction and validated input, produce the final assessment by calling"
+        " iam_evidence_result exactly once with keys: Answer, Quality, Source, Summary, Reference."
+        "\nRules: Do not output extra commentary outside the tool call; prefer a single functionResponse."
+    )
+
     agent = LlmAgent(
         model=model,
         name=os.getenv("ROOT_AGENT_NAME", "iam_evidence_agent"),
-        description="Evaluates IAM compliance evidence and generates structured assessment reports.",
-        instruction="You are an IAM compliance expert. Analyze provided evidence and generate structured JSON reports according to the system guidelines.",
+        description="Evaluates IAM compliance evidence using dynamic system instructions and returns structured results.",
+        instruction=instruction_text,
+        tools=[get_system_instruction, validate_and_list_evidences, iam_evidence_result],
     )
 
     return agent
