@@ -6,6 +6,8 @@ import uuid
 from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
+import logging
+from logging.handlers import RotatingFileHandler
 
 # ADK agent imports
 from google.adk.agents.llm_agent import LlmAgent
@@ -13,6 +15,20 @@ from tachyon_adk_client import TachyonAdkClient
 
 # Load environment variables
 load_dotenv()
+
+IAM_EVIDENCE_DEBUG = os.getenv("IAM_EVIDENCE_DEBUG", "false").lower() == "true"
+
+# Logger setup
+LOG_DIR = os.getenv("IAM_EVIDENCE_LOG_DIR", "logs")
+LOG_FILE = os.path.join(LOG_DIR, os.getenv("IAM_EVIDENCE_LOG_FILE", "iam_evidence.log"))
+os.makedirs(LOG_DIR, exist_ok=True)
+logger = logging.getLogger("iam_evidence")
+if not logger.handlers:
+    logger.setLevel(logging.DEBUG if IAM_EVIDENCE_DEBUG else logging.INFO)
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Optional MongoDB imports (only if USE_MONGO=true)
 try:
@@ -29,7 +45,8 @@ def load_system_instruction_from_file() -> Optional[str]:
         with open(path, "r", encoding="utf-8") as f:
             txt = f.read().strip()
             return txt or None
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to read system instruction file: %s", e)
         return None
 
 def fetch_system_instruction_from_mongo(app_id: str, control_id: str) -> Optional[str]:
@@ -49,7 +66,8 @@ def fetch_system_instruction_from_mongo(app_id: str, control_id: str) -> Optiona
             {"systemInstruction": 1, "_id": 0}
         )
         return (doc or {}).get("systemInstruction")
-    except Exception:
+    except Exception as e:
+        logger.warning("Mongo fetch failed: %s", e)
         return None
 
 def resolve_system_instruction(app_id: str, control_id: str) -> Optional[str]:
@@ -89,7 +107,8 @@ def decode_inline_payload(parts: list) -> dict:
             try:
                 raw = base64.b64decode(inline["data"]).decode("utf-8")
                 return json.loads(raw)
-            except Exception:
+            except Exception as e:
+                logger.debug("Inline payload decode failed: %s", e)
                 continue
     return {}
 
@@ -105,7 +124,8 @@ def parse_model_json(txt: str) -> dict:
     try:
         obj = json.loads(s)
         return obj if isinstance(obj, dict) else {"Answer": s}
-    except Exception:
+    except Exception as e:
+        logger.debug("Model text not JSON: %s", e)
         return {
             "Answer": s,
             "Quality": "N/A",
@@ -116,18 +136,34 @@ def parse_model_json(txt: str) -> dict:
 
 # Tools exposed to the LLM
 
-def get_system_instruction(appId: str, controlId: str) -> str:  # noqa: N802 (match input casing)
+def get_system_instruction(appId: str, controlId: str) -> str:  # noqa: N802
     """Return the resolved system instruction text for this app/control."""
     txt = resolve_system_instruction(appId, controlId)
     if not txt:
         raise ValueError("System instruction not found for the given appId/controlId")
+    if IAM_EVIDENCE_DEBUG:
+        logger.debug("Loaded system instruction len=%s for appId=%s controlId=%s", len(txt), appId, controlId)
     return txt
 
 def validate_and_list_evidences(evidences: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Validate evidence objects and return cleaned list and names."""
     cleaned = validate_evidences(evidences)
     names = [e["fileName"] for e in cleaned]
+    if IAM_EVIDENCE_DEBUG:
+        logger.debug("Validated evidences: names=%s", names)
     return {"cleaned": cleaned, "evidenceNames": names}
+
+# JSON-string variants to avoid missing-args tool call issues
+
+def validate_and_list_evidences_json(evidences_json: str) -> Dict[str, Any]:
+    """Accept evidences as JSON string to reduce tool arg shape errors."""
+    try:
+        parsed = json.loads(evidences_json) if evidences_json else []
+    except Exception as e:
+        raise ValueError(f"Invalid evidences_json: {e}")
+    if not isinstance(parsed, list):
+        raise ValueError("evidences_json must be a JSON array")
+    return validate_and_list_evidences(parsed)
 
 def iam_evidence_result(Answer: str, Quality: str, Source: str, Summary: str, Reference: str) -> Dict[str, str]:
     """Final structured result to be emitted as a functionResponse."""
@@ -139,6 +175,30 @@ def iam_evidence_result(Answer: str, Quality: str, Source: str, Summary: str, Re
         "Reference": Reference,
     }
 
+def iam_evidence_result_json(payload_json: str) -> Dict[str, str]:
+    """JSON-string variant to avoid missing-args failures from tool calls."""
+    try:
+        payload = json.loads(payload_json or "{}")
+    except Exception as e:
+        raise ValueError(f"Invalid payload_json: {e}")
+    for key in ["Answer", "Quality", "Source", "Summary", "Reference"]:
+        if key not in payload:
+            payload.setdefault(key, "")
+    return {
+        "Answer": str(payload.get("Answer", "")),
+        "Quality": str(payload.get("Quality", "")),
+        "Source": str(payload.get("Source", "")),
+        "Summary": str(payload.get("Summary", "")),
+        "Reference": str(payload.get("Reference", "")),
+    }
+
+# Optional debug tool
+
+def debug_dump(message: str) -> str:
+    if IAM_EVIDENCE_DEBUG:
+        logger.debug("%s", message)
+    return "ok"
+
 # Create the IAM Evidence Agent
 def create_iam_evidence_agent():
     """Create the IAM Evidence evaluation agent using LlmAgent + TachyonAdkClient."""
@@ -146,8 +206,8 @@ def create_iam_evidence_agent():
     required_vars = ['MODEL', 'API_KEY', 'BASE_URL', 'USE_CASE_ID', 'UUID']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     if missing_vars:
-        print(f"[WARNING] Missing environment variables: {missing_vars}")
-        print("Please check your .env file and ensure all required variables are set.")
+        logger.warning("Missing environment variables: %s", missing_vars)
+        logger.warning("Please check your .env file and ensure all required variables are set.")
 
     model = TachyonAdkClient(
         model_name=f"openai/{os.getenv('MODEL', os.getenv('LLM_MODEL_ID', 'gemini-2.0-flash'))}",
@@ -158,14 +218,16 @@ def create_iam_evidence_agent():
     )
 
     instruction_text = (
-        "You are an IAM compliance expert. Follow these steps strictly:"  # concise, deterministic
+        "You are an IAM compliance expert. Follow these steps strictly:"
         "\n1) The user provides a JSON payload as inline data with fields appId, controlId, evidences[]."
         "\n2) Read that JSON and extract appId, controlId, and evidences."
         "\n3) Call get_system_instruction(appId, controlId) to retrieve the system instruction text."
-        "\n4) Call validate_and_list_evidences(evidences) to validate and list evidence names."
+        "\n4) EITHER (a) call validate_and_list_evidences(evidences) with a proper array argument,"
+        " OR (b) call validate_and_list_evidences_json(JSON.stringify(evidences)) to avoid shape errors."
         "\n5) Using the retrieved system instruction and validated input, produce the final assessment by calling"
-        " iam_evidence_result exactly once with keys: Answer, Quality, Source, Summary, Reference."
-        "\nRules: Do not output extra commentary outside the tool call; prefer a single functionResponse."
+        " iam_evidence_result with explicit arguments OR iam_evidence_result_json(JSON.stringify({...}))."
+        "\nRules: Always pass explicit, non-empty arguments. Do not emit a function call with missing args."
+        " Prefer a single functionResponse and no extra commentary."
     )
 
     agent = LlmAgent(
@@ -173,8 +235,21 @@ def create_iam_evidence_agent():
         name=os.getenv("ROOT_AGENT_NAME", "iam_evidence_agent"),
         description="Evaluates IAM compliance evidence using dynamic system instructions and returns structured results.",
         instruction=instruction_text,
-        tools=[get_system_instruction, validate_and_list_evidences, iam_evidence_result],
+        tools=[
+            get_system_instruction,
+            validate_and_list_evidences,
+            validate_and_list_evidences_json,
+            iam_evidence_result,
+            iam_evidence_result_json,
+            debug_dump,
+        ],
     )
+
+    if IAM_EVIDENCE_DEBUG:
+        logger.debug("Agent initialized")
+        logger.debug("Instruction length: %s", len(instruction_text))
+        logger.debug("Tools registered: get_system_instruction, validate_and_list_evidences, "
+                     "validate_and_list_evidences_json, iam_evidence_result, iam_evidence_result_json, debug_dump")
 
     return agent
 
