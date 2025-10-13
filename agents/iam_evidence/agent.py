@@ -5,9 +5,11 @@ import os
 import uuid
 from typing import Dict, List, Optional
 
-from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
 from dotenv import load_dotenv
+
+# ADK agent imports
+from google.adk.agents.llm_agent import LlmAgent
+from tachyon_adk_client import TachyonAdkClient
 
 # Load environment variables
 load_dotenv()
@@ -114,17 +116,26 @@ def parse_model_json(txt: str) -> dict:
 
 # Create the IAM Evidence Agent
 def create_iam_evidence_agent():
-    """Create the IAM Evidence evaluation agent."""
-    # LLM configuration
-    llm = LiteLlm(
-        model="gemini-1.5-flash",
-        api_key=os.environ.get("GOOGLE_API_KEY")
+    """Create the IAM Evidence evaluation agent using LlmAgent + TachyonAdkClient."""
+    # Validate required env like hello_tachyon
+    required_vars = ['MODEL', 'API_KEY', 'BASE_URL', 'USE_CASE_ID', 'UUID']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        print(f"[WARNING] Missing environment variables: {missing_vars}")
+        print("Please check your .env file and ensure all required variables are set.")
+
+    model = TachyonAdkClient(
+        model_name=f"openai/{os.getenv('MODEL', os.getenv('LLM_MODEL_ID', 'gemini-2.0-flash'))}",
+        base_url=os.getenv('BASE_URL'),
+        api_key=os.getenv('API_KEY'),
+        use_case_id=os.getenv('USE_CASE_ID'),
+        uuid=os.getenv('UUID'),
     )
 
-    agent = Agent(
-        name="iam_evidence_agent",
+    agent = LlmAgent(
+        model=model,
+        name=os.getenv("ROOT_AGENT_NAME", "iam_evidence_agent"),
         description="Evaluates IAM compliance evidence and generates structured assessment reports.",
-        model=llm,
         instruction="You are an IAM compliance expert. Analyze provided evidence and generate structured JSON reports according to the system guidelines.",
     )
 
