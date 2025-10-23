@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
+import json
 from google.adk.tools.tool_context import ToolContext  # ADK Artifacts API
 from google.genai import types  # Part/Content if needed by stack
 import pandas as pd
@@ -58,8 +59,13 @@ class NHAComplianceAgent:
         ]
 
         # Add local file ingestion tool so agents can load uploaded evidence
-        # Use ADK ToolContext variant (async) while keeping the same tool name
-        self.tools.append(FunctionTool(load_uploaded_evidence))
+        # Prefer ADK ToolContext variant (async) if already defined; fallback to instance method
+        _tc_loader = globals().get('load_uploaded_evidence')
+        if _tc_loader:
+            self.tools.append(FunctionTool(_tc_loader))
+        else:
+            logger.warning("ToolContext load_uploaded_evidence not yet defined; using instance loader fallback")
+            self.tools.append(FunctionTool(self.load_uploaded_evidence))
         # Add native chat upload ingestion tool (accepts files from ADK Web UI)
         self.tools.append(FunctionTool(self.ingest_uploaded_evidence))
 
@@ -383,33 +389,7 @@ except Exception as _e:
         ),
         tools=[],
     )
-    """Fetch system instruction from MongoDB (optional fallback)."""
-    if os.getenv("USE_MONGO", "false").lower() != "true":
-        return None
-
-    if not MONGO_AVAILABLE:
-        return None
-
-    try:
-        client = MongoClient(os.getenv("MONGO_URI"))
-        db_name = os.getenv("MONGO_DB", "iam_eval")
-        coll_name = os.getenv("MONGO_SYSTEM_COLLECTION", "system_instructions")
-        doc = client[db_name][coll_name].find_one(
-            {"appId": app_id, "controlId": control_id},
-            {"systemInstruction": 1, "_id": 0}
-        )
-        return (doc or {}).get("systemInstruction")
-    except Exception:
-        return None
-
-def resolve_system_instruction(app_id: str, control_id: str) -> Optional[str]:
-    """Resolve system instruction: file first, then Mongo fallback."""
-    # 1) Try text file first
-    txt = load_system_instruction_from_file()
-    if txt:
-        return txt
-    # 2) If enabled, fallback to Mongo
-    return fetch_system_instruction_from_mongo(app_id, control_id)
+    # Removed stray top-level code that referenced undefined names and used 'return' at module scope.
 
 # Evidence validation
 def validate_evidences(evidences: List[Dict]) -> List[Dict]:
@@ -464,26 +444,7 @@ def parse_model_json(txt: str) -> dict:
             "Reference": ""
         }
 
-# Create the IAM Evidence Agent
-def create_iam_evidence_agent():
-    """Create the IAM Evidence evaluation agent."""
-    # LLM configuration
-    llm = LiteLlm(
-        model="gemini-1.5-flash",
-        api_key=os.environ.get("GOOGLE_API_KEY")
-    )
-
-    agent = Agent(
-        name="iam_evidence_agent",
-        description="Evaluates IAM compliance evidence and generates structured assessment reports.",
-        model=llm,
-        instruction="You are an IAM compliance expert. Analyze provided evidence and generate structured JSON reports according to the system guidelines.",
-    )
-
-    return agent
-
-# Expose root_agent for ADK
-root_agent = create_iam_evidence_agent()
+# (Removed alternate LiteLLM-based agent to avoid unsupported content parts.)
 
 # ==== ADK ToolContext-based helper constants and functions for artifact conversion ====
 
