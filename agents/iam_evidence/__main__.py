@@ -22,25 +22,74 @@ logger = logging.getLogger(__name__)
 # Load env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
+A2A_MAX_CHARS = int(os.getenv("IAM_EVIDENCE_A2A_MAX_CHARS", "120000"))
+
 class SimpleTaskManager:
     def __init__(self, agent):
         self.agent = agent
 
     async def process_task(self, message: str, context: dict, session_id: str | None):
-        # Build minimal ADK-style content from message/context
+        # Build ADK-style content from message/context, but sanitize inlineData to avoid huge prompts
         from google.genai import types as adk_types
-
-        # Convert context to a short JSON string for the model
         import json
-        try:
-            ctx_str = json.dumps(context or {})
-        except Exception:
-            ctx_str = str(context)
+        import base64
 
+        new_message = (context or {}).get("new_message") or {}
+        parts = new_message.get("parts") or []
+
+        # Extract and sanitize inline JSON if present
+        sanitized_summary = {}
+        for p in parts:
+            inline = p.get("inlineData")
+            if inline and inline.get("mimeType") == "application/json":
+                try:
+                    raw = base64.b64decode(inline["data"]).decode("utf-8")
+                    obj = json.loads(raw) if raw else {}
+                    evidences = obj.get("evidences") or []
+                    # summarize evidences: drop base64, keep meta and size if we can infer
+                    summarized = []
+                    for e in evidences:
+                        b64 = e.get("base64")
+                        size = 0
+                        if isinstance(b64, str):
+                            # approximate size; base64 inflates ~33%
+                            size = len(b64)
+                        summarized.append({
+                            "fileName": e.get("fileName"),
+                            "mimeType": e.get("mimeType"),
+                            "sizeChars": size,
+                        })
+                    sanitized_summary = {
+                        "appId": obj.get("appId"),
+                        "controlId": obj.get("controlId"),
+                        "evidences": summarized,
+                        "evidenceCount": len(summarized),
+                    }
+                except Exception as e:
+                    logger.warning("Failed to sanitize inlineData: %s", e)
+
+        # Build compact context for the model
+        compact_ctx = {
+            "user_id": context.get("user_id"),
+            "session_id": session_id,
+            "sanitized": sanitized_summary,
+        }
+        try:
+            ctx_str = json.dumps(compact_ctx, separators=(",", ":"))
+        except Exception:
+            ctx_str = str(compact_ctx)
+
+        # Construct content with message + compact context only (no raw base64)
         request_content = adk_types.Content(role="user", parts=[
             adk_types.Part(text=message or "Evaluate IAM evidences"),
             adk_types.Part(text=ctx_str),
         ])
+
+        # Size gate
+        total_chars = len((message or "")) + len(ctx_str)
+        logger.info("A2A prompt size chars=%s (limit=%s)", total_chars, A2A_MAX_CHARS)
+        if total_chars > A2A_MAX_CHARS:
+            return {"message": "Request too large after sanitization", "status": "error", "data": {"error_type": "RequestTooLarge"}}
 
         # Call the agent model; collect final message text only (no function call here)
         events_text = ""
@@ -66,7 +115,6 @@ class SimpleTaskManager:
 
         # Try to parse model text as JSON result
         try:
-            import json
             parsed = json.loads(events_text)
         except Exception:
             parsed = {"Answer": events_text, "Quality": "N/A", "Source": "", "Summary": "", "Reference": ""}
