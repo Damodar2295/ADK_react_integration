@@ -4,11 +4,13 @@ import logging
 import base64
 import uuid
 from pathlib import Path
-from io import BytesIO
-import csv
 from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
+from google.adk.tools.tool_context import ToolContext  # ADK Artifacts API
+from google.genai import types  # Part/Content if needed by stack
+import pandas as pd
+import io
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.tools.function_tool import FunctionTool
 from tachyon_adk_client import TachyonAdkClient
@@ -40,28 +42,6 @@ except ImportError:
     from jira_tools import JiraTools
     from mongodb_tools import MongoDBTools
 
-# Optional dependencies for tabular and MSG parsing
-try:
-    import pandas as _pd  # type: ignore
-    _PANDAS_AVAILABLE = True
-except Exception:
-    _pd = None
-    _PANDAS_AVAILABLE = False
-
-try:
-    import openpyxl as _openpyxl  # type: ignore
-    _OPENPYXL_AVAILABLE = True
-except Exception:
-    _openpyxl = None
-    _OPENPYXL_AVAILABLE = False
-
-try:
-    import extract_msg as _extract_msg  # type: ignore
-    _EXTRACT_MSG_AVAILABLE = True
-except Exception:
-    _extract_msg = None
-    _EXTRACT_MSG_AVAILABLE = False
-
 
 class NHAComplianceAgent:
     """Non-MCP NHA Compliance Agent using direct tools with LLM-driven delegation"""
@@ -78,12 +58,10 @@ class NHAComplianceAgent:
         ]
 
         # Add local file ingestion tool so agents can load uploaded evidence
-        self.tools.append(FunctionTool(self.load_uploaded_evidence))
+        # Use ADK ToolContext variant (async) while keeping the same tool name
+        self.tools.append(FunctionTool(load_uploaded_evidence))
         # Add native chat upload ingestion tool (accepts files from ADK Web UI)
         self.tools.append(FunctionTool(self.ingest_uploaded_evidence))
-        # Add tools for CSV/Excel and Outlook MSG parsing
-        self.tools.append(FunctionTool(self.convert_tabular_to_text_by_ids))
-        self.tools.append(FunctionTool(self.extract_outlook_msg_by_ids))
 
         self.mongo_tools = mongo_tools_instance
         self._setup_environment()
@@ -330,7 +308,7 @@ class NHAComplianceAgent:
                 return {'id': evid_id, 'filename': fname, 'size': len(content)}
             except Exception as e:
                 logging.warning(f"[ingest_uploaded_evidence] Failed to normalize item: {e}")
-                return None
+        return None
 
         for it in files[:limit]:
             norm = _normalize_one(it)
@@ -358,171 +336,6 @@ class NHAComplianceAgent:
             else:
                 logging.warning(f"[analyze_evidence_by_ids] Missing file id: {fid}")
         return self.mongo_tools.analyze_evidence_files(files, system_instructions)
-
-    # Tool: convert_tabular_to_text_by_ids
-    def convert_tabular_to_text_by_ids(
-        self,
-        file_ids: List[str],
-        sheet_name: Optional[str] = None,
-        max_rows: int = 1000,
-        max_chars: int = 200000,
-    ) -> Dict[str, Any]:
-        """Convert CSV/Excel evidence into plain text for LLM processing.
-
-        Returns a dict with keys:
-        - texts: list of { id, filename, text, rows, cols, note }
-        - errors: list of { id, filename, error }
-        """
-        outputs: List[Dict[str, Any]] = []
-        errors: List[Dict[str, str]] = []
-
-        def _decode_with_fallback(data: bytes) -> str:
-            for enc in ("utf-8", "utf-16", "utf-16le", "utf-16be", "latin-1"):
-                try:
-                    return data.decode(enc)
-                except Exception:
-                    continue
-            return data.decode("utf-8", errors="replace")
-
-        for fid in file_ids:
-            item = self._evidence_cache.get(fid)
-            if not item:
-                errors.append({"id": fid, "filename": "", "error": "file id not found in cache"})
-                continue
-            name = item.get("filename", "")
-            content_b64 = item.get("content", "")
-            try:
-                raw = base64.b64decode(content_b64)
-            except Exception as e:
-                errors.append({"id": fid, "filename": name, "error": f"invalid base64: {e}"})
-                continue
-
-            ext = Path(name).suffix.lower()
-            note = ""
-            text = ""
-            rows = 0
-            cols = 0
-
-            try:
-                if ext == ".csv":
-                    decoded = _decode_with_fallback(raw)
-                    reader = csv.reader(decoded.splitlines())
-                    lines: List[str] = []
-                    for r, row in enumerate(reader):
-                        if r >= max_rows:
-                            note = f"truncated to {max_rows} rows"
-                            break
-                        cols = max(cols, len(row))
-                        lines.append(" | ".join(str(c) for c in row))
-                    text = "\n".join(lines)
-                elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"):
-                    if _PANDAS_AVAILABLE:
-                        try:
-                            df = _pd.read_excel(BytesIO(raw), sheet_name=sheet_name or 0, dtype=str, engine=None)
-                            if hasattr(df, "to_string"):
-                                df = df.head(max_rows)
-                                rows, cols = df.shape
-                                text = df.to_csv(index=False)
-                                if rows >= max_rows:
-                                    note = f"truncated to {max_rows} rows"
-                        except Exception as e:
-                            note = f"pandas excel read failed: {e}"
-                    elif _OPENPYXL_AVAILABLE and ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
-                        wb = _openpyxl.load_workbook(BytesIO(raw), read_only=True, data_only=True)
-                        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-                        lines: List[str] = []
-                        for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
-                            if r_idx >= max_rows:
-                                note = f"truncated to {max_rows} rows"
-                                break
-                            row_vals = ["" if v is None else str(v) for v in row]
-                            cols = max(cols, len(row_vals))
-                            lines.append(" | ".join(row_vals))
-                        text = "\n".join(lines)
-                    else:
-                        raise RuntimeError("Excel parsing unavailable; install pandas or openpyxl")
-                else:
-                    raise RuntimeError(f"unsupported extension: {ext}")
-
-                if len(text) > max_chars:
-                    text = text[:max_chars]
-                    note = (note + "; " if note else "") + f"truncated to {max_chars} characters"
-
-                outputs.append({
-                    "id": fid,
-                    "filename": name,
-                    "text": text,
-                    "rows": rows,
-                    "cols": cols,
-                    "note": note,
-                })
-            except Exception as e:
-                errors.append({"id": fid, "filename": name, "error": str(e)})
-
-        return {"texts": outputs, "errors": errors}
-
-    # Tool: extract_outlook_msg_by_ids
-    def extract_outlook_msg_by_ids(
-        self,
-        file_ids: List[str],
-        max_chars: int = 200000,
-        include_headers: bool = True,
-    ) -> Dict[str, Any]:
-        """Extracts text and headers from Outlook .msg files in cache.
-
-        Returns a dict with keys:
-        - messages: list of { id, filename, subject, sender, to, date, body, note }
-        - errors: list of { id, filename, error }
-        """
-        messages: List[Dict[str, Any]] = []
-        errors: List[Dict[str, str]] = []
-
-        for fid in file_ids:
-            item = self._evidence_cache.get(fid)
-            if not item:
-                errors.append({"id": fid, "filename": "", "error": "file id not found in cache"})
-                continue
-            name = item.get("filename", "")
-            ext = Path(name).suffix.lower()
-            if ext != ".msg":
-                errors.append({"id": fid, "filename": name, "error": "not an Outlook .msg file"})
-                continue
-            content_b64 = item.get("content", "")
-            try:
-                raw = base64.b64decode(content_b64)
-            except Exception as e:
-                errors.append({"id": fid, "filename": name, "error": f"invalid base64: {e}"})
-                continue
-
-            try:
-                if not _EXTRACT_MSG_AVAILABLE:
-                    raise RuntimeError("extract-msg not installed; cannot parse .msg")
-
-                with _extract_msg.openMsg(BytesIO(raw)) as msg:  # type: ignore[attr-defined]
-                    subject = (msg.subject or "").strip()
-                    sender = (getattr(msg, "sender", "") or getattr(msg, "senderEmail", "") or "").strip()
-                    to = (getattr(msg, "to", "") or getattr(msg, "recipients", "") or "").strip()
-                    date = str(getattr(msg, "date", "")).strip()
-                    body = (msg.body or "").strip()
-                    if len(body) > max_chars:
-                        body = body[:max_chars]
-                        note = f"truncated to {max_chars} characters"
-                    else:
-                        note = ""
-                messages.append({
-                    "id": fid,
-                    "filename": name,
-                    "subject": subject,
-                    "sender": sender,
-                    "to": to,
-                    "date": date,
-                    "body": body,
-                    "note": note,
-                })
-            except Exception as e:
-                errors.append({"id": fid, "filename": name, "error": str(e)})
-
-        return {"messages": messages, "errors": errors}
 
     def start(self):
         """Start the NHA Compliance Agent"""
@@ -570,3 +383,171 @@ except Exception as _e:
         ),
         tools=[],
     )
+    """Fetch system instruction from MongoDB (optional fallback)."""
+    if os.getenv("USE_MONGO", "false").lower() != "true":
+        return None
+
+    if not MONGO_AVAILABLE:
+        return None
+
+    try:
+        client = MongoClient(os.getenv("MONGO_URI"))
+        db_name = os.getenv("MONGO_DB", "iam_eval")
+        coll_name = os.getenv("MONGO_SYSTEM_COLLECTION", "system_instructions")
+        doc = client[db_name][coll_name].find_one(
+            {"appId": app_id, "controlId": control_id},
+            {"systemInstruction": 1, "_id": 0}
+        )
+        return (doc or {}).get("systemInstruction")
+    except Exception:
+        return None
+
+def resolve_system_instruction(app_id: str, control_id: str) -> Optional[str]:
+    """Resolve system instruction: file first, then Mongo fallback."""
+    # 1) Try text file first
+    txt = load_system_instruction_from_file()
+    if txt:
+        return txt
+    # 2) If enabled, fallback to Mongo
+    return fetch_system_instruction_from_mongo(app_id, control_id)
+
+# Evidence validation
+def validate_evidences(evidences: List[Dict]) -> List[Dict]:
+    """Validate evidence format and clean base64 data."""
+    out = []
+    for e in evidences or []:
+        if not all(k in e for k in ("fileName", "mimeType", "base64")):
+            raise ValueError(f"Invalid evidence format; expected fileName/mimeType/base64: {list(e.keys())}")
+
+        b64 = e["base64"]
+        if isinstance(b64, str) and "base64," in b64[:80]:
+            b64 = b64.split("base64,", 1)[-1]
+
+        out.append({
+            "fileName": e["fileName"],
+            "mimeType": e["mimeType"],
+            "base64": b64
+        })
+    return out
+
+# Inline payload decoder
+def decode_inline_payload(parts: list) -> dict:
+    """Decode inline JSON payload from /run parts[].inlineData."""
+    for p in parts or []:
+        inline = p.get("inlineData")
+        if inline and inline.get("mimeType") == "application/json":
+            try:
+                raw = base64.b64decode(inline["data"]).decode("utf-8")
+                return json.loads(raw)
+            except Exception:
+                continue
+    return {}
+
+# Robust JSON parsing
+def parse_model_json(txt: str) -> dict:
+    """Parse model output as JSON, with fallback to text."""
+    s = (txt or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {"Answer": s}
+    except Exception:
+        return {
+            "Answer": s,
+            "Quality": "N/A",
+            "Source": "",
+            "Summary": "",
+            "Reference": ""
+        }
+
+# Create the IAM Evidence Agent
+def create_iam_evidence_agent():
+    """Create the IAM Evidence evaluation agent."""
+    # LLM configuration
+    llm = LiteLlm(
+        model="gemini-1.5-flash",
+        api_key=os.environ.get("GOOGLE_API_KEY")
+    )
+
+    agent = Agent(
+        name="iam_evidence_agent",
+        description="Evaluates IAM compliance evidence and generates structured assessment reports.",
+        model=llm,
+        instruction="You are an IAM compliance expert. Analyze provided evidence and generate structured JSON reports according to the system guidelines.",
+    )
+
+    return agent
+
+# Expose root_agent for ADK
+root_agent = create_iam_evidence_agent()
+
+# ==== ADK ToolContext-based helper constants and functions for artifact conversion ====
+
+CSV_MIMES = {"text/csv"}
+XLS_MIMES = {
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+CSV_EXTS = {".csv"}
+XLS_EXTS = {".xls", ".xlsx"}
+
+def _is_csv_or_excel(filename: str, mime_type: Optional[str]) -> bool:
+    ext = (filename or "").lower().rsplit(".", 1)
+    ext = f".{ext[-1]}" if len(ext) == 2 else ""
+    mt = (mime_type or "").lower()
+    return (ext in CSV_EXTS or ext in XLS_EXTS) or (mt in CSV_MIMES or mt in XLS_MIMES)
+
+def _bytes_to_markdown_table(data: bytes, mime: str, name: str) -> str:
+    """Convert CSV/XLSX bytes to a compact GitHub-flavored markdown table."""
+    if mime in CSV_MIMES or name.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(data))
+    else:
+        df = pd.read_excel(io.BytesIO(data), sheet_name=0)
+    return df.to_markdown(index=False)
+
+
+# Existing signature must remain the same
+async def load_uploaded_evidence(tool_context: ToolContext, filename: str) -> dict:  # type: ignore[override]
+    """
+    Existing behavior preserved.
+    Added: if CSV/XLSX, convert to markdown and register as artifact; include in evidence_artifacts.
+    Returns (backward-compatible) dict with 'evidence_artifacts' plus:
+      - 'converted': bool
+      - 'markdown_artifact': <name>.md.txt  (present only when converted)
+    """
+    try:
+        part = await tool_context.load_artifact(filename)
+        inline = getattr(part, "inline_data", None)
+        mime = getattr(inline, "mime_type", "") or ""
+        data = getattr(inline, "data", None)
+
+        base_name = filename.rsplit("/", 1)[-1]
+        evidence_artifacts: list[str] = [base_name]
+        converted = False
+        md_artifact_name: Optional[str] = None
+
+        if _is_csv_or_excel(base_name, mime) and data:
+            md_text = _bytes_to_markdown_table(data, mime, base_name)
+            md_artifact_name = f"{base_name}.md.txt"
+            await tool_context.save_artifact(
+                name=md_artifact_name,
+                data=md_text.encode("utf-8"),
+                mime_type="text/markdown",
+            )
+            evidence_artifacts.append(md_artifact_name)
+            converted = True
+            logger.info(f"Converted '{base_name}' -> '{md_artifact_name}' via ToolContext.save_artifact")
+
+        return {
+            "status": "success",
+            "evidence_artifacts": evidence_artifacts,
+            "converted": converted,
+            **({"markdown_artifact": md_artifact_name} if md_artifact_name else {}),
+        }
+    except Exception as e:
+        logger.exception("load_uploaded_evidence failed: %s", e)
+        return {"status": "error", "message": f"load_uploaded_evidence failed: {e}"}
