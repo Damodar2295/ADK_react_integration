@@ -1,0 +1,19 @@
+classDiagram
+  class EvidenceItem {
+    id: string
+    filename: string
+    size: int
+  }
+
+  class EvidenceCacheItem {
+    filename: string
+    content: base64 string
+  }
+
+  class ToolResult {
+    status: "success" | "error"
+    evidence_artifacts: string[]
+    converted: bool
+    markdown_artifact: string?
+    message: string?
+  }

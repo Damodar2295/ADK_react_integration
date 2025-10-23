@@ -1,0 +1,34 @@
+sequenceDiagram
+  actor User
+  participant UI as ADK Web UI
+  participant TC as ToolContext
+  participant RA as Coordinator (LlmAgent)
+  participant SA as Control Sub-Agent
+  participant IT3 as load_uploaded_evidence(ToolContext)
+  participant EC as Evidence Cache
+  participant AEF as analyze_evidence_by_ids
+  participant MT as MongoDBTools
+  participant MDB as MongoDB
+
+  User->>UI: Upload sample.xlsx
+  UI->>TC: Store artifact (sample.xlsx)
+  UI->>RA: Provide control_id, app_name, files[]
+  RA->>RA: ensure_control_agents([control_id])
+  RA->>SA: transfer_to_agent(control_id)
+  SA->>IT3: load_uploaded_evidence(TC, "sample.xlsx")
+  IT3->>TC: load_artifact("sample.xlsx")
+  IT3->>IT3: Detect Excel -> pandas.read_excel
+  IT3->>TC: save_artifact("sample.xlsx.md.txt", text/markdown)
+  IT3-->>SA: {evidence_artifacts:["sample.xlsx","sample.xlsx.md.txt"], converted:true}
+  SA->>SA: Filter files relevant to app
+  SA->>MT: get_system_instructions(control_id)
+  MT->>MDB: findOne(prompt_name=control_id)
+  MDB-->>MT: system_instruction
+  SA->>EC: cache IDs (via ingest/load tools)
+  SA->>AEF: analyze_evidence_by_ids(file_ids, system_instructions)
+  AEF->>EC: resolve ids -> [{filename, base64}]
+  AEF->>MT: analyze_evidence_files(files, system_instructions)
+  MT->>MDB: optional persistence/report
+  MT-->>AEF: analysis dict
+  SA-->>RA: control-specific report
+  RA-->>User: Combined compliance report

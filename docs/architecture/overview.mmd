@@ -1,0 +1,57 @@
+%%{init: {"themeVariables": {"fontSize": "20px", "fontFamily": "Arial"}} }%%
+flowchart TB
+  %% Simple architecture overview
+
+  subgraph Client
+    User["User"]
+    UI["ADK Web UI"]
+  end
+
+  subgraph Server
+    Coord["Coordinator Agent"]
+    SubA["Sub Agents (per control)"]
+
+    Ingest["Ingest uploads"]
+    LoadArt["Load artifact"]
+    Analyze["Analyze by ids"]
+    GetInstr["Get system instructions"]
+
+    Cache[("Evidence Cache")]
+  end
+
+  subgraph Infra
+    Mongo[("MongoDB")] 
+    Artifacts[("Artifact Store")]
+    Model["Model via TachyonAdkClient"]
+    REST["Any REST endpoint"]
+  end
+
+  User --> UI
+  UI --> Coord
+
+  Coord -->|delegates| SubA
+
+  %% Tool calls from sub-agents
+  SubA -->|call| GetInstr
+  GetInstr --> Mongo
+
+  SubA -->|call| Ingest
+  Ingest --> Cache
+
+  SubA -->|call| LoadArt
+  LoadArt --> Artifacts
+
+  SubA -->|call| Analyze
+  Analyze --> Cache
+  Analyze --> Mongo
+
+  %% LLM usage
+  Coord --> Model
+  SubA --> Model
+
+  %% Output exposure
+  Coord -->|combined report| REST
+
+  %% Bold styling
+  classDef bold font-weight:bold;
+  class User,UI,Coord,SubA,Ingest,LoadArt,Analyze,GetInstr,Cache,Mongo,Artifacts,Model,REST bold

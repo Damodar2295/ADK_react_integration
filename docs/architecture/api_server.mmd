@@ -1,0 +1,45 @@
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 70, "rankSpacing": 80}, "themeVariables": {"fontSize": "22px", "fontFamily": "Arial"}} }%%
+flowchart LR
+  %% ADK Web API Server exposing the agent as REST
+
+  subgraph Consumers
+    Clients["Consumers\n(Client apps / Postman)"]
+  end
+
+  subgraph API [ADK Web API Server]
+    Rest["REST Endpoints\nPOST /api/upload\nPOST /api/validate\nGET /api/report/{id}"]
+    ServerNode["ADK API Server\n(Router + Controller)"]
+  end
+
+  subgraph Agent [Agent Layer]
+    Coord["Coordinator"]
+    Subs["Sub-Agents\n(per control)"]
+    Tools["Tools\n- Ingest uploads\n- Load artifact\n- Get instructions\n- Analyze by ids"]
+    Cache[("Evidence Cache")]
+  end
+
+  subgraph Infra
+    Mongo[("MongoDB")] 
+    Artifacts[("Artifact Store")]
+    Model["Model (TachyonAdkClient)"]
+  end
+
+  %% Ingress
+  Clients --> Rest --> ServerNode --> Coord --> Subs
+
+  %% Tool usage (grouped)
+  Subs --> Tools
+  Tools --> Cache
+  Tools --> Mongo
+  Tools --> Artifacts
+
+  %% LLM usage
+  Coord --> Model
+  Subs --> Model
+
+  %% Egress
+  ServerNode -->|HTTP response: JSON report| Clients
+
+  %% Emphasis
+  classDef bold font-weight:bold;
+  class Rest,ServerNode,Coord,Subs,Tools,Cache,Mongo,Artifacts,Model,Clients bold
