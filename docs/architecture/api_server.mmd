@@ -1,4 +1,4 @@
-%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 70, "rankSpacing": 80}, "themeVariables": {"fontSize": "22px", "fontFamily": "Arial"}} }%%
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 70, "rankSpacing": 80}, "themeVariables": {"fontSize": "22px", "fontFamily": "Segoe UI, Verdana, Arial, sans-serif"}} }%%
 flowchart LR
   %% ADK Web API Server exposing the agent as REST
 
@@ -14,13 +14,12 @@ flowchart LR
   subgraph Agent [Agent Layer]
     Coord["Coordinator"]
     Subs["Sub-Agents\n(per control)"]
-    Tools["Tools\n- Ingest uploads\n- Load artifact\n- Get instructions\n- Analyze by ids"]
+    Tools["Tools\n- Ingest uploads\n- Get instructions\n- Analyze by ids\n(Tachyon handles file formats)"]
     Cache[("Evidence Cache")]
   end
 
   subgraph Infra
     Mongo[("MongoDB")] 
-    Artifacts[("Artifact Store")]
     Model["Model (TachyonAdkClient)"]
   end
 
@@ -31,7 +30,6 @@ flowchart LR
   Subs --> Tools
   Tools --> Cache
   Tools --> Mongo
-  Tools --> Artifacts
 
   %% LLM usage
   Coord --> Model
@@ -42,4 +40,4 @@ flowchart LR
 
   %% Emphasis
   classDef bold font-weight:bold;
-  class Rest,ServerNode,Coord,Subs,Tools,Cache,Mongo,Artifacts,Model,Clients bold
+  class Rest,ServerNode,Coord,Subs,Tools,Cache,Mongo,Model,Clients bold

@@ -1,6 +1,6 @@
-%%{init: {"themeVariables": {"fontSize": "20px", "fontFamily": "Arial"}} }%%
-flowchart TB
-  %% Simple architecture overview
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 70, "rankSpacing": 80}, "themeVariables": {"fontSize": "22px", "fontFamily": "Segoe UI, Verdana, Arial, sans-serif"}} }%%
+flowchart LR
+  %% Simple architecture overview (REST-exposable)
 
   subgraph Client
     User["User"]
@@ -12,7 +12,6 @@ flowchart TB
     SubA["Sub Agents (per control)"]
 
     Ingest["Ingest uploads"]
-    LoadArt["Load artifact"]
     Analyze["Analyze by ids"]
     GetInstr["Get system instructions"]
 
@@ -21,15 +20,11 @@ flowchart TB
 
   subgraph Infra
     Mongo[("MongoDB")] 
-    Artifacts[("Artifact Store")]
     Model["Model via TachyonAdkClient"]
     REST["Any REST endpoint"]
   end
 
-  User --> UI
-  UI --> Coord
-
-  Coord -->|delegates| SubA
+  User --> UI --> Coord -->|delegates| SubA
 
   %% Tool calls from sub-agents
   SubA -->|call| GetInstr
@@ -37,9 +32,6 @@ flowchart TB
 
   SubA -->|call| Ingest
   Ingest --> Cache
-
-  SubA -->|call| LoadArt
-  LoadArt --> Artifacts
 
   SubA -->|call| Analyze
   Analyze --> Cache
@@ -54,4 +46,4 @@ flowchart TB
 
   %% Bold styling
   classDef bold font-weight:bold;
-  class User,UI,Coord,SubA,Ingest,LoadArt,Analyze,GetInstr,Cache,Mongo,Artifacts,Model,REST bold
+  class User,UI,Coord,SubA,Ingest,Analyze,GetInstr,Cache,Mongo,Model,REST bold
